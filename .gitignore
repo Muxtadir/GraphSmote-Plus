@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/cora/
+data/BlogCatalog/
+checkpoint/**/*.pth
+research/checkpoints/
+*.pth
+.ipynb_checkpoints/

@@ -9,6 +9,7 @@ import torch.optim as optim
 import models
 import utils
 import data_load
+import tam as tam_lib
 import random
 import ipdb
 import copy
@@ -20,15 +21,17 @@ parser = utils.get_parser()
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
+args = utils.resolve_sta_flags(args)
 
-'''
+# Seeding (uncommented for multi-seed reproduction / STA fairness vs baseline CSV).
+# Same four lines as upstream GraphSMOTE; does not add cudnn.deterministic flags.
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
-'''
 
+utils.log_sta_hyperparams(args)
 # Load data
 if args.dataset == 'cora':
     adj, features, labels = data_load.load_data()
@@ -167,50 +170,74 @@ def train(epoch):
 
     embed = encoder(features, adj)
 
-    if args.setting == 'recon_newG' or args.setting == 'recon' or args.setting == 'newG_cls':
+    # GraphSMOTE edge-generation settings + GraphSMOTE-STA counterparts (additive).
+    gs_edge_settings = ('recon_newG', 'recon', 'newG_cls', 'sta_recon_newG', 'sta_newG_cls')
+    if args.setting in gs_edge_settings:
         ori_num = labels.shape[0]
-        embed, labels_new, idx_train_new, adj_up = utils.recon_upsample(embed, labels, idx_train, adj=adj.detach().to_dense(),portion=args.up_scale, im_class_num=im_class_num)
+        adj_dense = adj.detach().to_dense()
+        # STA only when explicitly enabled; baseline path keeps sta_attach=or_template.
+        embed, labels_new, idx_train_new, adj_up = utils.recon_upsample(
+            embed, labels, idx_train, adj=adj_dense, portion=args.up_scale,
+            im_class_num=im_class_num,
+            sta_attach=args.sta_attach,
+            sta_candidate=args.sta_candidate,
+            sta_gate_nn=args.sta_gate_nn,
+            sta_gate_thresh=args.sta_gate_thresh,
+            sta_top_k=args.sta_top_k,
+        )
         generated_G = decoder(embed)
 
-        loss_rec = utils.adj_mse_loss(generated_G[:ori_num, :][:, :ori_num], adj.detach().to_dense())
+        loss_rec = utils.adj_mse_loss(generated_G[:ori_num, :][:, :ori_num], adj_dense)
         
         #ipdb.set_trace()
 
-
-        if not args.opt_new_G:
-            adj_new = copy.deepcopy(generated_G.detach())
-            threshold = 0.5
-            adj_new[adj_new<threshold] = 0.0
-            adj_new[adj_new>=threshold] = 1.0
-
-            #ipdb.set_trace()
-            edge_ac = adj_new[:ori_num, :ori_num].eq(adj.to_dense()).double().sum()/(ori_num**2)
+        if utils.sta_enabled(args) and args.sta_attach in ('anchor_soft', 'anchor_hard'):
+            # GraphSMOTE-STA: soft/hard scores inside anchor-local (or ablation) mask.
+            adj_new = utils.apply_sta_attachment(
+                generated_G, adj_up, ori_num, adj_dense,
+                sta_edge_mode=args.sta_edge_mode,
+                sta_threshold=args.sta_threshold,
+                sta_temp=args.sta_temp,
+                sta_top_k=args.sta_top_k,
+                opt_new_G=args.opt_new_G,
+            )
         else:
-            adj_new = generated_G
-            edge_ac = F.l1_loss(adj_new[:ori_num, :ori_num], adj.to_dense(), reduction='mean')
+            # Original GraphSMOTE attachment (Zhao et al., WSDM 2021) — unchanged.
+            if not args.opt_new_G:
+                adj_new = copy.deepcopy(generated_G.detach())
+                threshold = 0.5
+                adj_new[adj_new<threshold] = 0.0
+                adj_new[adj_new>=threshold] = 1.0
+
+                #ipdb.set_trace()
+                edge_ac = adj_new[:ori_num, :ori_num].eq(adj.to_dense()).double().sum()/(ori_num**2)
+            else:
+                adj_new = generated_G
+                edge_ac = F.l1_loss(adj_new[:ori_num, :ori_num], adj.to_dense(), reduction='mean')
 
 
-        #calculate generation information
-        exist_edge_prob = adj_new[:ori_num, :ori_num].mean() #edge prob for existing nodes
-        generated_edge_prob = adj_new[ori_num:, :ori_num].mean() #edge prob for generated nodes
-        print("edge acc: {:.4f}, exist_edge_prob: {:.4f}, generated_edge_prob: {:.4f}".format(edge_ac.item(), exist_edge_prob.item(), generated_edge_prob.item()))
+            #calculate generation information
+            exist_edge_prob = adj_new[:ori_num, :ori_num].mean() #edge prob for existing nodes
+            generated_edge_prob = adj_new[ori_num:, :ori_num].mean() #edge prob for generated nodes
+            print("edge acc: {:.4f}, exist_edge_prob: {:.4f}, generated_edge_prob: {:.4f}".format(edge_ac.item(), exist_edge_prob.item(), generated_edge_prob.item()))
 
 
-        adj_new = torch.mul(adj_up, adj_new)
+            adj_new = torch.mul(adj_up, adj_new)
 
-        exist_edge_prob = adj_new[:ori_num, :ori_num].mean() #edge prob for existing nodes
-        generated_edge_prob = adj_new[ori_num:, :ori_num].mean() #edge prob for generated nodes
-        print("after filtering, edge acc: {:.4f}, exist_edge_prob: {:.4f}, generated_edge_prob: {:.4f}".format(edge_ac.item(), exist_edge_prob.item(), generated_edge_prob.item()))
+            exist_edge_prob = adj_new[:ori_num, :ori_num].mean() #edge prob for existing nodes
+            generated_edge_prob = adj_new[ori_num:, :ori_num].mean() #edge prob for generated nodes
+            print("after filtering, edge acc: {:.4f}, exist_edge_prob: {:.4f}, generated_edge_prob: {:.4f}".format(edge_ac.item(), exist_edge_prob.item(), generated_edge_prob.item()))
 
 
-        adj_new[:ori_num, :][:, :ori_num] = adj.detach().to_dense()
-        #adj_new = adj_new.to_sparse()
-        #ipdb.set_trace()
+            adj_new[:ori_num, :][:, :ori_num] = adj.detach().to_dense()
+            #adj_new = adj_new.to_sparse()
+            #ipdb.set_trace()
 
-        if not args.opt_new_G:
-            adj_new = adj_new.detach()
+            if not args.opt_new_G:
+                adj_new = adj_new.detach()
 
-        if args.setting == 'newG_cls':
+        # Match GraphSMOTE quirk: newG_cls / sta_newG_cls CE uses original idx_train only.
+        if args.setting in ('newG_cls', 'sta_newG_cls'):
             idx_train_new = idx_train
 
     elif args.setting == 'embed_up':
@@ -225,17 +252,41 @@ def train(epoch):
     #ipdb.set_trace()
     output = classifier(embed, adj_new)
 
-
+    # Classifier CE logits: optional TAM (Song et al., ICML 2022). Off ⇒ identical to GraphSMOTE.
+    # Never apply during decoder pretrain (`recon`). Val/test logging still uses raw `output`.
+    logits_ce = output
+    if args.tam and args.setting != 'recon':
+        class_num_list = tam_lib.train_class_counts(labels, idx_train)
+        # Original-graph topology for NLD (not the augmented classifier graph).
+        adj_for_tam = adj.detach()
+        if adj_for_tam.is_sparse:
+            adj_for_tam = adj_for_tam.to_dense()
+        logits_ce = tam_lib.adjust_logits_tam(
+            output,
+            adj_for_tam,
+            labels_new if labels_new.shape[0] == output.shape[0] else labels,
+            idx_train,
+            class_num_list=class_num_list,
+            epoch=epoch,
+            tam_alpha=args.tam_alpha,
+            tam_beta=args.tam_beta,
+            tam_phi=args.tam_phi,
+            tam_delta=args.tam_delta,
+            tam_warmup=args.tam_warmup,
+            tam_scope=args.tam_scope,
+            idx_train_new=idx_train_new,
+            n_orig=labels.shape[0],
+        )
 
     if args.setting == 'reweight':
         weight = features.new((labels.max().item()+1)).fill_(1)
         weight[-im_class_num:] = 1+args.up_scale
-        loss_train = F.cross_entropy(output[idx_train_new], labels_new[idx_train_new], weight=weight)
+        loss_train = F.cross_entropy(logits_ce[idx_train_new], labels_new[idx_train_new], weight=weight)
     else:
-        loss_train = F.cross_entropy(output[idx_train_new], labels_new[idx_train_new])
+        loss_train = F.cross_entropy(logits_ce[idx_train_new], labels_new[idx_train_new])
 
     acc_train = utils.accuracy(output[idx_train], labels_new[idx_train])
-    if args.setting == 'recon_newG':
+    if args.setting in ('recon_newG', 'sta_recon_newG'):
         loss = loss_train+loss_rec*args.rec_weight
     elif args.setting == 'recon':
         loss = loss_rec + 0*loss_train
@@ -244,7 +295,7 @@ def train(epoch):
         loss_rec = loss_train
 
     loss.backward()
-    if args.setting == 'newG_cls':
+    if args.setting in ('newG_cls', 'sta_newG_cls'):
         optimizer_en.zero_grad()
         optimizer_de.zero_grad()
     else:
@@ -252,15 +303,14 @@ def train(epoch):
 
     optimizer_cls.step()
 
-    if args.setting == 'recon_newG' or args.setting == 'recon':
+    if args.setting in ('recon_newG', 'sta_recon_newG', 'recon'):
         optimizer_de.step()
 
     loss_val = F.cross_entropy(output[idx_val], labels[idx_val])
     acc_val = utils.accuracy(output[idx_val], labels[idx_val])
 
     #ipdb.set_trace()
-    utils.print_class_acc(output[idx_val], labels[idx_val], class_num_mat[:,1])
-
+    utils.print_class_acc(output[idx_val], labels[idx_val], class_num_mat[:,1], im_class_num=im_class_num)
     print('Epoch: {:05d}'.format(epoch+1),
           'loss_train: {:.4f}'.format(loss_train.item()),
           'loss_rec: {:.4f}'.format(loss_rec.item()),
@@ -282,7 +332,7 @@ def test(epoch = 0):
           "loss= {:.4f}".format(loss_test.item()),
           "accuracy= {:.4f}".format(acc_test.item()))
 
-    utils.print_class_acc(output[idx_test], labels[idx_test], class_num_mat[:,2], pre='test')
+    utils.print_class_acc(output[idx_test], labels[idx_test], class_num_mat[:,2], pre='test', im_class_num=im_class_num)
 
     '''
     if epoch==40:
@@ -297,7 +347,13 @@ def save_model(epoch):
     saved_content['decoder'] = decoder.state_dict()
     saved_content['classifier'] = classifier.state_dict()
 
-    torch.save(saved_content, 'checkpoint/{}/{}_{}_{}_{}.pth'.format(args.dataset,args.setting,epoch, args.opt_new_G, args.im_ratio))
+    # Baseline GraphSMOTE keeps original filename pattern. STA adds attach tag to avoid clobber.
+    if utils.sta_enabled(args):
+        torch.save(saved_content, 'checkpoint/{}/{}_{}_{}_{}_{}.pth'.format(
+            args.dataset, args.setting, epoch, args.opt_new_G, args.im_ratio, args.sta_attach))
+    else:
+        torch.save(saved_content, 'checkpoint/{}/{}_{}_{}_{}.pth'.format(
+            args.dataset, args.setting, epoch, args.opt_new_G, args.im_ratio))
 
     return
 
